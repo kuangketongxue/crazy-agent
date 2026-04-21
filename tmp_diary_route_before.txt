@@ -1,0 +1,123 @@
+﻿import { NextResponse } from "next/server";
+import { z } from "zod";
+import { requireAuth } from "@/lib/auth";
+import { db } from "@/lib/db";
+import { backupMemoryEvent } from "@/lib/memory-backup";
+
+const saveSchema = z.object({
+  diaryDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+  successJournal: z.string().max(12000).default(""),
+  moneyJournal: z.string().max(12000).default(""),
+  gaokaoJournal: z.string().max(12000).default(""),
+});
+
+function toMemoryContent(payload: z.infer<typeof saveSchema>) {
+  return [
+    `鏃ユ湡: ${payload.diaryDate}`,
+    "",
+    "鎴愬姛鏃ヨ:",
+    payload.successJournal.trim() || "(绌?",
+    "",
+    "璧氶挶鏃ヨ:",
+    payload.moneyJournal.trim() || "(绌?",
+    "",
+    "楂樿€冩棩璁?",
+    payload.gaokaoJournal.trim() || "(绌?",
+  ].join("\n");
+}
+
+export async function GET(request: Request) {
+  const user = await requireAuth();
+  if (user instanceof NextResponse) return user;
+
+  const url = new URL(request.url);
+  const diaryDate = (url.searchParams.get("date") || "").trim();
+
+  if (diaryDate) {
+    const { rows } = await db.query(
+      `
+      SELECT diary_date, success_journal, money_journal, gaokao_journal, updated_at
+      FROM diary_entries
+      WHERE user_id = $1 AND diary_date = $2::date
+      LIMIT 1
+      `,
+      [user.userId, diaryDate],
+    );
+    return NextResponse.json({ entry: rows[0] || null });
+  }
+
+  const { rows } = await db.query(
+    `
+    SELECT diary_date, success_journal, money_journal, gaokao_journal, updated_at
+    FROM diary_entries
+    WHERE user_id = $1
+    ORDER BY diary_date DESC
+    LIMIT 60
+    `,
+    [user.userId],
+  );
+  return NextResponse.json({ entries: rows });
+}
+
+export async function PUT(request: Request) {
+  const user = await requireAuth();
+  if (user instanceof NextResponse) return user;
+
+  const parsed = saveSchema.safeParse(await request.json().catch(() => ({})));
+  if (!parsed.success) {
+    return NextResponse.json({ error: "鍙傛暟閿欒" }, { status: 400 });
+  }
+
+  const payload = parsed.data;
+
+  const { rows } = await db.query(
+    `
+    INSERT INTO diary_entries (user_id, diary_date, success_journal, money_journal, gaokao_journal, updated_at)
+    VALUES ($1, $2::date, $3, $4, $5, now())
+    ON CONFLICT (user_id, diary_date)
+    DO UPDATE SET
+      success_journal = EXCLUDED.success_journal,
+      money_journal = EXCLUDED.money_journal,
+      gaokao_journal = EXCLUDED.gaokao_journal,
+      updated_at = now()
+    RETURNING id, diary_date, success_journal, money_journal, gaokao_journal, updated_at
+    `,
+    [user.userId, payload.diaryDate, payload.successJournal, payload.moneyJournal, payload.gaokaoJournal],
+  );
+
+  const memoryTitle = `鏃ヨ-${payload.diaryDate}`;
+  const memoryContent = toMemoryContent(payload);
+  const sourcePointer = `diary:${payload.diaryDate}`;
+
+  const memory = await db.query(
+    `
+    INSERT INTO memory_entries (user_id, title, content, entry_type, status, source_pointer, updated_at)
+    VALUES ($1, $2, $3, 'diary', 'valid', $4, now())
+    ON CONFLICT (user_id, source_pointer) WHERE source_pointer IS NOT NULL
+    DO UPDATE SET
+      title = EXCLUDED.title,
+      content = EXCLUDED.content,
+      status = 'valid',
+      importance = LEAST(1.0, memory_entries.importance + 0.03),
+      updated_at = now()
+    RETURNING id, title, content, entry_type, status, source_pointer
+    `,
+    [user.userId, memoryTitle, memoryContent, sourcePointer],
+  );
+
+  if (memory.rows[0]) {
+    await backupMemoryEvent({
+      sourceEntryId: memory.rows[0].id,
+      sourceUserId: user.userId,
+      title: memory.rows[0].title,
+      content: memory.rows[0].content,
+      entryType: memory.rows[0].entry_type,
+      status: memory.rows[0].status,
+      sourcePointer: memory.rows[0].source_pointer,
+      action: "update",
+    });
+  }
+
+  return NextResponse.json({ ok: true, entry: rows[0] || null });
+}
+
